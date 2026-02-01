@@ -59,6 +59,68 @@ if is_accelerate_available():
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
+def unblock_nvfp4_scale(weight_scale):
+    # Reverse of ComfyUI's to_blocked function used for NVFP4 scales
+    H, W = weight_scale.shape
+    n_row_blocks = H // 128
+    n_col_blocks = W // 4
+
+    if n_row_blocks * 128 != H or n_col_blocks * 4 != W:
+        return weight_scale
+
+    x = weight_scale.reshape(n_row_blocks * n_col_blocks, 32, 16)
+    x = x.view(n_row_blocks * n_col_blocks, 32, 4, 4)
+    x = x.transpose(1, 2)  # (N, 4, 32, 4)
+    x = x.reshape(n_row_blocks, n_col_blocks, 128, 4)
+    x = x.permute(0, 2, 1, 3)  # (n_row_blocks, 128, n_col_blocks, 4)
+    return x.reshape(H, W)
+
+
+def dequantize_nvfp4(weight, weight_scale, weight_scale_2, target_dtype=torch.bfloat16):
+    # weight: [Out, In/2] uint8 (packed FP4 E2M1)
+    # weight_scale: [Out, In/16] float8_e4m3fn (block scale)
+    # weight_scale_2: [] float32 (global scale)
+
+    out_features, in_features_half = weight.shape
+    in_features = in_features_half * 2
+    device = weight.device
+
+    # 1. Unpack nibbles
+    weight_unpacked = torch.empty((out_features, in_features_half, 2), dtype=torch.uint8, device=device)
+    weight_unpacked[..., 0] = (weight >> 4) & 0x0F
+    weight_unpacked[..., 1] = weight & 0x0F
+    weight_unpacked = weight_unpacked.view(out_features, in_features)
+
+    # 2. FP4 E2M1 to float
+    # Val = (1 + m/2) * 2^(e-1) if e > 0 else m/2
+    sign = (weight_unpacked >> 3) & 0x01
+    exp = (weight_unpacked >> 1) & 0x03
+    mant = weight_unpacked & 0x01
+
+    val = torch.where(
+        exp > 0,
+        (1.0 + mant.to(torch.float32) / 2.0) * (2.0 ** (exp.to(torch.float32) - 1.0)),
+        mant.to(torch.float32) / 2.0,
+    )
+    val = torch.where(sign == 1, -val, val)
+
+    # 3. Apply scales
+    s1 = unblock_nvfp4_scale(weight_scale.to(torch.float32))
+    s1 = s1.repeat_interleave(16, dim=1)
+
+    return (val * s1 * weight_scale_2.to(torch.float32)).to(target_dtype)
+
+
+def _safe_slice_chunk(tensor, num_chunks, dim=0):
+    # This helper performs the split manually using slices.
+    # We use this because NVFP4Tensor only implements slicing, not split/chunk/split_with_sizes.
+    if hasattr(tensor, "shape"):
+        size = tensor.shape[dim]
+        chunk_size = size // num_chunks
+        return [tensor[i * chunk_size : (i + 1) * chunk_size] for i in range(num_chunks)]
+    return torch.chunk(tensor, num_chunks, dim=dim)
+
+
 CHECKPOINT_KEY_NAMES = {
     "v1": "model.diffusion_model.output_blocks.11.0.skip_connection.weight",
     "v2": "model.diffusion_model.input_blocks.2.1.transformer_blocks.0.attn2.to_k.weight",
@@ -2263,13 +2325,18 @@ def convert_flux_transformer_checkpoint_to_diffusers(checkpoint, **kwargs):
 
     ## time_text_embed.timestep_embedder <-  time_in
     converted_state_dict["time_text_embed.timestep_embedder.linear_1.weight"] = checkpoint.pop(
-        "time_in.in_layer.weight"
+        "time_in.in_layer.weight", None
     )
-    converted_state_dict["time_text_embed.timestep_embedder.linear_1.bias"] = checkpoint.pop("time_in.in_layer.bias")
+    bias_key = "time_in.in_layer.bias"
+    if bias_key in checkpoint:
+        converted_state_dict["time_text_embed.timestep_embedder.linear_1.bias"] = checkpoint.pop(bias_key)
+
     converted_state_dict["time_text_embed.timestep_embedder.linear_2.weight"] = checkpoint.pop(
-        "time_in.out_layer.weight"
+        "time_in.out_layer.weight", None
     )
-    converted_state_dict["time_text_embed.timestep_embedder.linear_2.bias"] = checkpoint.pop("time_in.out_layer.bias")
+    bias_key = "time_in.out_layer.bias"
+    if bias_key in checkpoint:
+        converted_state_dict["time_text_embed.timestep_embedder.linear_2.bias"] = checkpoint.pop(bias_key)
 
     ## time_text_embed.text_embedder <- vector_in
     converted_state_dict["time_text_embed.text_embedder.linear_1.weight"] = checkpoint.pop("vector_in.in_layer.weight")
@@ -3875,16 +3942,14 @@ def convert_flux2_transformer_checkpoint_to_diffusers(checkpoint, **kwargs):
 
             if "qkv" in within_block_name:
                 fused_qkv_weight = state_dict.pop(key)
-                to_q_weight, to_k_weight, to_v_weight = torch.chunk(fused_qkv_weight, 3, dim=0)
+                to_q_weight, to_k_weight, to_v_weight = _safe_slice_chunk(fused_qkv_weight, 3, dim=0)
                 if "img" in modality_block_name:
                     # double_blocks.{N}.img_attn.qkv --> transformer_blocks.{N}.attn.{to_q|to_k|to_v}
-                    to_q_weight, to_k_weight, to_v_weight = torch.chunk(fused_qkv_weight, 3, dim=0)
                     new_q_name = "attn.to_q"
                     new_k_name = "attn.to_k"
                     new_v_name = "attn.to_v"
                 elif "txt" in modality_block_name:
                     # double_blocks.{N}.txt_attn.qkv --> transformer_blocks.{N}.attn.{add_q_proj|add_k_proj|add_v_proj}
-                    to_q_weight, to_k_weight, to_v_weight = torch.chunk(fused_qkv_weight, 3, dim=0)
                     new_q_name = "attn.add_q_proj"
                     new_k_name = "attn.add_k_proj"
                     new_v_name = "attn.add_v_proj"
@@ -3904,6 +3969,74 @@ def convert_flux2_transformer_checkpoint_to_diffusers(checkpoint, **kwargs):
 
     def update_state_dict(state_dict: dict[str, object], old_key: str, new_key: str) -> None:
         state_dict[new_key] = state_dict.pop(old_key)
+
+    # Dequantize or wrap NVFP4 weights if present
+    # Determine GPU architecture and best loading strategy
+    device_capability = (0, 0)
+    if torch.cuda.is_available():
+        device_capability = torch.cuda.get_device_capability()
+
+    # Strategy selection:
+    # Blackwell (SM 12.0+): BF16 (Best balance of quality/speed) | Native NVFP4 (Opt-in via FLUX_NATIVE_NVFP4=1)
+    # Ada (SM 8.9): BF16 (Default) | FP8 (via FLUX_USE_FP8=1)
+    # Ampere (SM 8.0): BF16
+    # Turing (SM 7.5): FP16
+    
+    # Native NVFP4 is currently experimental in torchao and produces artifacts on some weights.
+    # We default to high-quality BF16 dequantization for production stability.
+    use_native_nvfp4 = os.environ.get("FLUX_NATIVE_NVFP4") == "1" and device_capability[0] >= 12
+    
+    # Check if user wants FP8 (only beneficial on Ada/Blackwell)
+    if os.environ.get("FLUX_USE_FP8") == "1" and device_capability[0] >= 9:
+        target_dtype = torch.float8_e4m3fn
+    elif os.environ.get("FLUX_FORCE_FP16") == "1" or device_capability[0] < 8:
+        target_dtype = torch.float16
+    else:
+        target_dtype = torch.bfloat16
+
+    # Attempt to load torchao if native path is requested
+    NVFP4Tensor = None
+    if use_native_nvfp4:
+        try:
+            from torchao.prototype.mx_formats.nvfp4_tensor import NVFP4Tensor as _NVFP4Tensor
+            from torchao.prototype.mx_formats.nvfp4_tensor import QuantizeTensorToNVFP4Kwargs
+            NVFP4Tensor = _NVFP4Tensor
+        except ImportError:
+            use_native_nvfp4 = False
+
+    for key in list(checkpoint.keys()):
+        if key.endswith(".weight") and key + "_scale" in checkpoint:
+            weight = checkpoint.pop(key)
+            weight_scale = checkpoint.pop(key + "_scale")
+            weight_scale_2 = checkpoint.pop(key + "_scale_2")
+            # Also clean up input_scale if present
+            if key + "_input_scale" in checkpoint:
+                checkpoint.pop(key + "_input_scale")
+
+            if weight.dtype == torch.uint8:
+                if use_native_nvfp4 and NVFP4Tensor is not None:
+                    # Native Blackwell path: Wrap in NVFP4Tensor
+                    # We enable dynamic activation quantization for maximal performance
+                    act_quant_kwargs = QuantizeTensorToNVFP4Kwargs(
+                        use_dynamic_per_tensor_scale=True,
+                        is_swizzled_scales=True,
+                        use_triton_kernel=True
+                    )
+                    checkpoint[key] = NVFP4Tensor(
+                        weight, 
+                        weight_scale, 
+                        block_size=16, 
+                        orig_dtype=target_dtype, 
+                        per_tensor_scale=weight_scale_2,
+                        is_swizzled_scales=True,
+                        act_quant_kwargs=act_quant_kwargs
+                    )
+                else:
+                    # Fallback path: Dequantize to high precision or FP8
+                    checkpoint[key] = dequantize_nvfp4(weight, weight_scale, weight_scale_2, target_dtype=target_dtype)
+            else:
+                # Fallback if already dequantized or wrong type
+                checkpoint[key] = weight.to(target_dtype)
 
     TRANSFORMER_SPECIAL_KEYS_REMAP = {
         "adaLN_modulation": convert_ada_layer_norm_weights,
