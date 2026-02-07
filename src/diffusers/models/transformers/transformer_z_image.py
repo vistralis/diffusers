@@ -100,9 +100,12 @@ class ZSingleStreamAttnProcessor:
         key = attn.to_k(hidden_states)
         value = attn.to_v(hidden_states)
 
-        query = query.unflatten(-1, (attn.heads, -1))
-        key = key.unflatten(-1, (attn.heads, -1))
-        value = value.unflatten(-1, (attn.heads, -1))
+        # Use view instead of unflatten to avoid dynamic Shape/Slice ops in ONNX
+        batch_size, seq_len = hidden_states.shape[:2]
+        head_dim = query.shape[-1] // attn.heads
+        query = query.view(batch_size, seq_len, attn.heads, head_dim)
+        key = key.view(batch_size, seq_len, attn.heads, head_dim)
+        value = value.view(batch_size, seq_len, attn.heads, head_dim)
 
         # Apply Norms
         if attn.norm_q is not None:
@@ -110,13 +113,15 @@ class ZSingleStreamAttnProcessor:
         if attn.norm_k is not None:
             key = attn.norm_k(key)
 
-        # Apply RoPE
-        def apply_rotary_emb(x_in: torch.Tensor, freqs_cis: torch.Tensor) -> torch.Tensor:
+        # Apply RoPE — real-valued arithmetic only (ONNX-friendly, no complex dtypes)
+        def apply_rotary_emb(x_in: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
             with torch.amp.autocast("cuda", enabled=False):
-                x = torch.view_as_complex(x_in.float().reshape(*x_in.shape[:-1], -1, 2))
-                freqs_cis = freqs_cis.unsqueeze(2)
-                x_out = torch.view_as_real(x * freqs_cis).flatten(3)
-                return x_out.type_as(x_in)  # todo
+                x_pairs = x_in.float().reshape(*x_in.shape[:-1], -1, 2)  # [B, S, H, D/2, 2]
+                cos_f = torch.cos(freqs).unsqueeze(2)  # [B, S, 1, D/2]
+                sin_f = torch.sin(freqs).unsqueeze(2)
+                out_re = x_pairs[..., 0] * cos_f - x_pairs[..., 1] * sin_f
+                out_im = x_pairs[..., 0] * sin_f + x_pairs[..., 1] * cos_f
+                return torch.stack([out_re, out_im], dim=-1).flatten(3).type_as(x_in)
 
         if freqs_cis is not None:
             query = apply_rotary_emb(query, freqs_cis)
@@ -332,8 +337,7 @@ class RopeEmbedder:
                 freqs = 1.0 / (theta ** (torch.arange(0, d, 2, dtype=torch.float64, device="cpu") / d))
                 timestep = torch.arange(e, device=freqs.device, dtype=torch.float64)
                 freqs = torch.outer(timestep, freqs).float()
-                freqs_cis_i = torch.polar(torch.ones_like(freqs), freqs).to(torch.complex64)  # complex64
-                freqs_cis.append(freqs_cis_i)
+                freqs_cis.append(freqs)  # raw angles (real float), ONNX-friendly (no complex dtype)
 
             return freqs_cis
 
@@ -1038,3 +1042,165 @@ class ZImageTransformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOr
         x = self.unpatchify(list(unified.unbind(dim=0)), x_size, patch_size, f_patch_size, x_pos_offsets)
 
         return (x,) if not return_dict else Transformer2DModelOutput(sample=x)
+
+    def forward_single(
+        self,
+        image: torch.Tensor,
+        t: torch.Tensor,
+        cap_feat: torch.Tensor,
+        patch_size: int = 2,
+        f_patch_size: int = 1,
+    ):
+        """ONNX-friendly forward for batch_size=1, avoiding dynamic-shape ops.
+
+        Uses torch.where for masking (avoids NonZero+ScatterND) and explicit
+        cat+slice for padding (avoids pad_sequence with dynamic lengths).
+
+        Args:
+            image: [C, F, H, W] single image latent (not batched)
+            t: [1] timestep tensor
+            cap_feat: [seq, dim] single caption features (not batched)
+            patch_size: spatial patch size (default 2)
+            f_patch_size: frame patch size (default 1)
+
+        Returns:
+            output: [C, F, H, W] single denoised output (not batched)
+        """
+        assert patch_size in self.all_patch_size
+        assert f_patch_size in self.all_f_patch_size
+
+        device = image.device
+        pH = pW = patch_size
+        pF = f_patch_size
+
+        # Timestep embedding
+        t_scaled = t * self.t_scale
+        t_emb = self.t_embedder(t_scaled)
+
+        # --- Caption processing ---
+        cap_ori_len = cap_feat.shape[0]
+        cap_padding_len = (-cap_ori_len) % SEQ_MULTI_OF
+        cap_total_len = cap_ori_len + cap_padding_len
+
+        cap_pos_ids = self.create_coordinate_grid(
+            size=(cap_total_len, 1, 1), start=(1, 0, 0), device=device,
+        ).flatten(0, 2)
+
+        cap_indices = torch.arange(cap_total_len, dtype=torch.int64, device=device)
+        cap_pad_mask = cap_indices >= cap_ori_len
+
+        # Pad caption features (ONNX-friendly: always cat+slice)
+        cap_feat_padded = torch.cat(
+            [cap_feat, cap_feat[-1:].expand(SEQ_MULTI_OF, -1)], dim=0,
+        )[:cap_total_len]
+
+        # --- Image processing ---
+        C, F, H, W = image.shape
+        F_tokens, H_tokens, W_tokens = F // pF, H // pH, W // pW
+
+        image_tokens = image.view(C, F_tokens, pF, H_tokens, pH, W_tokens, pW)
+        image_tokens = image_tokens.permute(1, 3, 5, 2, 4, 6, 0).reshape(
+            F_tokens * H_tokens * W_tokens, pF * pH * pW * C
+        )
+
+        image_ori_len = image_tokens.shape[0]
+        image_padding_len = (-image_ori_len) % SEQ_MULTI_OF
+        image_total_len = image_ori_len + image_padding_len
+
+        image_ori_pos_ids = self.create_coordinate_grid(
+            size=(F_tokens, H_tokens, W_tokens),
+            start=(cap_total_len + 1, 0, 0),
+            device=device,
+        ).flatten(0, 2)
+
+        image_padding_pos_ids = self.create_coordinate_grid(
+            size=(1, 1, 1), start=(0, 0, 0), device=device,
+        ).flatten(0, 2).expand(SEQ_MULTI_OF, -1)
+        image_pos_ids = torch.cat([image_ori_pos_ids, image_padding_pos_ids], dim=0)[:image_total_len]
+
+        image_indices = torch.arange(image_total_len, dtype=torch.int64, device=device)
+        image_pad_mask = image_indices >= image_ori_len
+
+        image_tokens_padded = torch.cat(
+            [image_tokens, image_tokens[-1:].expand(SEQ_MULTI_OF, -1)], dim=0,
+        )[:image_total_len]
+
+        # Embed image tokens
+        x = self.all_x_embedder[f"{patch_size}-{f_patch_size}"](image_tokens_padded)
+
+        # Apply pad token using torch.where (ONNX-friendly, avoids NonZero+ScatterND)
+        adaln_input = t_emb.type_as(x)
+        x = torch.where(image_pad_mask.unsqueeze(-1), self.x_pad_token, x)
+
+        # Compute RoPE for image
+        x_freqs_cis = self.rope_embedder(image_pos_ids.to(torch.int64))
+
+        # Add batch dimension: [seq, dim] -> [1, seq, dim]
+        x = x.unsqueeze(0)
+        x_freqs_cis = x_freqs_cis.unsqueeze(0)
+        x_attn_mask = ~image_pad_mask.unsqueeze(0)
+
+        # Noise refiner
+        for layer in self.noise_refiner:
+            x = layer(x, x_attn_mask, x_freqs_cis, adaln_input)
+
+        # Embed caption
+        cap_feat_emb = self.cap_embedder(cap_feat_padded)
+        cap_feat_emb = torch.where(cap_pad_mask.unsqueeze(-1), self.cap_pad_token, cap_feat_emb)
+
+        # Compute RoPE for caption
+        cap_freqs_cis = self.rope_embedder(cap_pos_ids.to(torch.int64))
+
+        cap_feat_emb = cap_feat_emb.unsqueeze(0)
+        cap_freqs_cis = cap_freqs_cis.unsqueeze(0)
+        cap_attn_mask = ~cap_pad_mask.unsqueeze(0)
+
+        # Context refiner
+        for layer in self.context_refiner:
+            cap_feat_emb = layer(cap_feat_emb, cap_attn_mask, cap_freqs_cis)
+
+        # Unified sequence: [image, caption]
+        x_seq = x[0, :image_ori_len]
+        cap_seq = cap_feat_emb[0, :cap_ori_len]
+        unified = torch.cat([x_seq, cap_seq], dim=0)
+
+        unified_freqs = torch.cat([
+            x_freqs_cis[0, :image_ori_len],
+            cap_freqs_cis[0, :cap_ori_len],
+        ], dim=0)
+
+        # Pad unified to SEQ_MULTI_OF
+        unified_ori_len = unified.shape[0]
+        unified_padding_len = (-unified_ori_len) % SEQ_MULTI_OF
+        unified_total_len = unified_ori_len + unified_padding_len
+
+        unified = torch.cat(
+            [unified, unified[-1:].expand(SEQ_MULTI_OF, -1)], dim=0,
+        )[:unified_total_len]
+        unified_freqs = torch.cat(
+            [unified_freqs, unified_freqs[-1:].expand(SEQ_MULTI_OF, -1)], dim=0,
+        )[:unified_total_len]
+
+        unified = unified.unsqueeze(0)
+        unified_freqs = unified_freqs.unsqueeze(0)
+
+        unified_indices = torch.arange(unified_total_len, dtype=torch.int64, device=device)
+        unified_attn_mask = (unified_indices < unified_ori_len).unsqueeze(0)
+
+        # Main transformer layers
+        for layer in self.layers:
+            unified = layer(unified, unified_attn_mask, unified_freqs, adaln_input)
+
+        # Final layer
+        unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](unified, c=adaln_input)
+
+        # Extract image output and unpatchify
+        output_tokens = unified[0, :image_ori_len]
+        output = (
+            output_tokens
+            .view(F_tokens, H_tokens, W_tokens, pF, pH, pW, self.out_channels)
+            .permute(6, 0, 3, 1, 4, 2, 5)
+            .reshape(self.out_channels, F, H, W)
+        )
+
+        return output
